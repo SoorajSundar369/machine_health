@@ -1,0 +1,44 @@
+# Large data files (will recreate locally from main.py)
+data/synthetic/*.wav
+data/real/*.wav
+
+# Pre-trained model weights
+models/separation/*.pth
+models/classifier/*.pth
+models/separation/*.pt
+models/classifier/*.pt
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter cache
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
