@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -c \":*)",
+      "Bash(rm -f main.py pipeline_demo.py pipeline_demonstration.png visualization_normal_vs_fault.png visualization_normal_vs_noisy.png PHASE1_COMPLETION_REPORT.md src/separation.py src/features.py src/data.py)",
+      "Bash(rm -rf notebooks/ data/normal/ data/fault/)"
+    ]
+  }
+}
