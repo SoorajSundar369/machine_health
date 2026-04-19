@@ -1,5 +1,4 @@
 import tkinter as tk
-import winsound
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import librosa
@@ -297,11 +296,11 @@ class MachineHealthApp:
             self.rec_btn.config(state="disabled")
             try:
                 peak = np.max(np.abs(audio))
-                normalized = audio / peak if peak > 0 else audio
+                normalized = audio / peak * 0.95 if peak > 0 else audio
                 category = self.cat_var.get()
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 path = os.path.join(self.data_path, category, f"rec_{ts}.wav")
-                sf.write(path, normalized, SAMPLE_RATE)
+                sf.write(path, normalized, SAMPLE_RATE, subtype='PCM_16')
                 self.root.after(0, lambda: messagebox.showinfo("Saved", f"Saved as: {category}"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -457,14 +456,13 @@ class MachineHealthApp:
             return
         def play():
             self.root.after(0, lambda: self.replay_btn.config(state="disabled", text="Playing…"))
-            tmp_path = os.path.join(self.data_path, "_replay_tmp.wav")
             try:
                 audio = self._last_audio
                 peak  = np.max(np.abs(audio))
                 if peak > 0:
                     audio = audio / peak * REPLAY_NORM_PEAK
-                sf.write(tmp_path, audio, self._last_sr)
-                winsound.PlaySound(tmp_path, winsound.SND_FILENAME)
+                sd.play(audio, self._last_sr)
+                sd.wait()
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Playback Error", str(e)))
             finally:
