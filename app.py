@@ -5,6 +5,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 import sounddevice as sd
+import noisereduce as nr
 import joblib
 import os
 import threading
@@ -14,22 +15,43 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 
-# --- THEME ---
-BG      = "#f0f2f5"
-CARD    = "#ffffff"
-TEXT    = "#1a1a1a"
-MUTED   = "#6b7280"
-BLUE    = "#2563eb"
-GREEN   = "#16a34a"
-RED     = "#dc2626"
-BORDER  = "#e5e7eb"
+# ── Theme ─────────────────────────────────────────────────────────────────────
+BG     = "#f0f2f5"
+CARD   = "#ffffff"
+TEXT   = "#1a1a1a"
+MUTED  = "#6b7280"
+BLUE   = "#2563eb"
+GREEN  = "#16a34a"
+RED    = "#dc2626"
+BORDER = "#e5e7eb"
+PURPLE = "#7c3aed"
+
+# ── Audio constants ────────────────────────────────────────────────────────────
+SAMPLE_RATE       = 22050
+N_MFCC            = 40
+MAX_FREQ_HZ       = 8000
+N_ESTIMATORS      = 100
+DRAW_POINTS       = 4000   # max points when downsampling waveform for drawing
+REPLAY_NORM_PEAK  = 0.95   # ceiling for replay normalization
+LOG_EPS           = 1e-9   # prevent log(0)
+RT_CHUNK          = SAMPLE_RATE  # real-time chunk size = 1 second
+
+# ── Plot constants ─────────────────────────────────────────────────────────────
+PLOT_LW           = 0.7
+PLOT_FS           = 7.5
+DOM_FREQ_LW       = 0.8
+DOM_FREQ_X_OFF    = 0.05
+GRID_LW           = 0.4
+ZERO_LINE_LW      = 0.5
+PLOT_TITLE_FS     = 8
+PLOT_BG           = "#f8fafc"
 
 
 def extract_features(audio, sr):
     peak = np.max(np.abs(audio))
     if peak > 0:
-        audio = audio / peak          # normalize before any feature extraction
-    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=40)
+        audio = audio / peak
+    mfcc     = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
     centroid = np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr))
     rolloff  = np.mean(librosa.feature.spectral_rolloff(y=audio, sr=sr))
     zcr      = np.mean(librosa.feature.zero_crossing_rate(y=audio))
@@ -40,16 +62,21 @@ class MachineHealthApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Machine Health Monitor")
-        self.root.geometry("860x720")
+        self.root.geometry("860x820")
         self.root.configure(bg=BG)
 
-        self.models_loaded = False
-        self.binary_model = self.multi_model = self.label_encoder = None
-        self.is_recording = False
-        self.is_realtime  = False
-        self._last_audio  = None
-        self._last_sr     = None
-        self.data_path = "data"
+        self.models_loaded  = False
+        self.binary_model   = self.multi_model = self.label_encoder = None
+        self.is_realtime    = False
+        self._last_audio    = None
+        self._last_sr       = None
+        self.data_path      = "data"
+
+        # open-ended recording streams
+        self._stream        = None   # inspect tab
+        self._rec_buffer    = []
+        self._train_stream  = None   # train tab
+        self._train_buffer  = []
 
         for cat in ['normal', 'mechanical', 'electrical', 'wear']:
             os.makedirs(os.path.join(self.data_path, cat), exist_ok=True)
@@ -61,24 +88,28 @@ class MachineHealthApp:
 
     def _on_close(self):
         self.is_realtime = False
+        self._stop_inspect_stream()
+        self._stop_train_stream()
         sd.stop()
         plt.close("all")
         self.root.destroy()
         os._exit(0)
 
+    # ── styles ────────────────────────────────────────────────────────────────
+
     def _setup_styles(self):
         s = ttk.Style()
         s.theme_use('clam')
-        s.configure("TNotebook",      background=BG,   borderwidth=0)
-        s.configure("TNotebook.Tab",  background=CARD, foreground=MUTED,
-                    padding=[18, 7],  font=("Segoe UI", 10, "bold"))
+        s.configure("TNotebook",     background=BG,   borderwidth=0)
+        s.configure("TNotebook.Tab", background=CARD, foreground=MUTED,
+                    padding=[18, 7], font=("Segoe UI", 10, "bold"))
         s.map("TNotebook.Tab",
               background=[("selected", BLUE)],
               foreground=[("selected", "white")])
         s.configure("TProgressbar", thickness=8, troughcolor=BORDER, background=BLUE)
         s.configure("TCombobox",    fieldbackground=CARD, background=CARD, foreground=TEXT)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
+    # ── widget helpers ────────────────────────────────────────────────────────
 
     def _card(self, parent, **kw):
         return tk.Frame(parent, bg=CARD, bd=1, relief="flat",
@@ -91,14 +122,12 @@ class MachineHealthApp:
                          padx=14, pady=6, command=cmd, **kw)
 
     def _label(self, parent, text, size=10, bold=False, color=TEXT, **kw):
-        weight = "bold" if bold else "normal"
         return tk.Label(parent, text=text, bg=parent["bg"], fg=color,
-                        font=("Segoe UI", size, weight), **kw)
+                        font=("Segoe UI", size, "bold" if bold else "normal"), **kw)
 
-    # ── main layout ──────────────────────────────────────────────────────────
+    # ── layout ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # title bar
         bar = tk.Frame(self.root, bg=CARD, pady=12,
                        highlightbackground=BORDER, highlightthickness=1)
         bar.pack(fill="x")
@@ -112,68 +141,59 @@ class MachineHealthApp:
 
         self.inspect_tab = tk.Frame(nb, bg=BG)
         nb.add(self.inspect_tab, text="  Inspect  ")
-
         self.train_tab = tk.Frame(nb, bg=BG)
         nb.add(self.train_tab, text="  Train  ")
 
         self._build_inspect()
         self._build_train()
 
-    # ── inspect tab ──────────────────────────────────────────────────────────
+    # ── inspect tab ───────────────────────────────────────────────────────────
 
     def _build_inspect(self):
-        # controls row
         ctrl = tk.Frame(self.inspect_tab, bg=BG, pady=8)
         ctrl.pack(fill="x", padx=14)
         self._btn(ctrl, "Load Audio File", BLUE, self.load_file).pack(side="left", padx=(0, 8))
-        self.live_btn = self._btn(ctrl, "Start Live Check", RED, self.start_recording)
+        self.live_btn = self._btn(ctrl, "Start Live Check", RED, self._toggle_live)
         self.live_btn.pack(side="left", padx=(0, 8))
-        self.rt_btn = self._btn(ctrl, "Real-time Monitor", "#7c3aed", self._toggle_realtime)
+        self.rt_btn = self._btn(ctrl, "Real-time Monitor", PURPLE, self._toggle_realtime)
         self.rt_btn.pack(side="left", padx=(0, 8))
         self.replay_btn = self._btn(ctrl, "Replay", MUTED, self._replay)
         self.replay_btn.config(state="disabled")
         self.replay_btn.pack(side="left")
 
-        # waveform card
         wf_card = self._card(self.inspect_tab, pady=6)
         wf_card.pack(fill="x", padx=14, pady=(4, 8))
-        self.fig, (self.ax_wave, self.ax_spec) = plt.subplots(
-            2, 1, figsize=(7, 3.6), facecolor=CARD,
-            constrained_layout=True,
-            gridspec_kw={"hspace": 0.55}
+        self.fig, (self.ax_wave, self.ax_spec, self.ax_denoise) = plt.subplots(
+            3, 1, figsize=(7, 5.2), facecolor=CARD, constrained_layout=True
         )
-        for ax in (self.ax_wave, self.ax_spec):
-            ax.set_facecolor("#f8fafc")
+        for ax in (self.ax_wave, self.ax_spec, self.ax_denoise):
+            ax.set_facecolor(PLOT_BG)
             for spine in ax.spines.values():
                 spine.set_color(BORDER)
-            ax.tick_params(colors=MUTED, labelsize=7.5)
+            ax.tick_params(colors=MUTED, labelsize=PLOT_FS)
         self._draw_empty_plots()
         self.wf_canvas = FigureCanvasTkAgg(self.fig, master=wf_card)
         self.wf_canvas.get_tk_widget().pack(fill="x")
 
-        # result card
-        self.result_card = self._card(self.inspect_tab, padx=20, pady=16)
-        self.result_card.pack(fill="x", padx=14, pady=(0, 8))
-
-        self.res_status = self._label(self.result_card, "—", size=20, bold=True)
+        result_card = self._card(self.inspect_tab, padx=20, pady=16)
+        result_card.pack(fill="x", padx=14, pady=(0, 8))
+        self.res_status = self._label(result_card, "—", size=20, bold=True)
         self.res_status.pack(anchor="w")
-        self.res_detail = self._label(self.result_card, "Load a file or start a live check.", color=MUTED)
+        self.res_detail = self._label(result_card, "Load a file or start a live check.", color=MUTED)
         self.res_detail.pack(anchor="w", pady=(4, 10))
-
-        self.health_bar = tk.Canvas(self.result_card, height=6, bg=BORDER, highlightthickness=0)
+        self.health_bar = tk.Canvas(result_card, height=6, bg=BORDER, highlightthickness=0)
         self.health_bar.pack(fill="x")
 
-        # log
         log_frame = tk.Frame(self.inspect_tab, bg=BG)
         log_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         self._label(log_frame, "Log", size=9, color=MUTED).pack(anchor="w", pady=(0, 4))
-        self.log_box = tk.Text(log_frame, height=9, bg=CARD, fg=TEXT,
+        self.log_box = tk.Text(log_frame, height=6, bg=CARD, fg=TEXT,
                                font=("Consolas", 9), state="disabled",
                                relief="flat", padx=10, pady=8,
                                highlightbackground=BORDER, highlightthickness=1)
         self.log_box.pack(fill="both", expand=True)
 
-    # ── train tab ────────────────────────────────────────────────────────────
+    # ── train tab ─────────────────────────────────────────────────────────────
 
     def _build_train(self):
         outer = tk.Frame(self.train_tab, bg=BG, padx=14, pady=14)
@@ -181,133 +201,277 @@ class MachineHealthApp:
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
 
-        # ── collect card ──
         cc = self._card(outer, padx=16, pady=16)
         cc.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-
         self._label(cc, "1  Collect", size=11, bold=True).pack(anchor="w", pady=(0, 12))
         self._label(cc, "Label", color=MUTED, size=9).pack(anchor="w")
         self.cat_var = tk.StringVar(value="normal")
         ttk.Combobox(cc, textvariable=self.cat_var,
                      values=['normal', 'mechanical', 'electrical', 'wear'],
                      state="readonly", font=("Segoe UI", 10)).pack(fill="x", pady=(2, 12))
-
-        self.rec_btn = self._btn(cc, "Record 3s", BLUE, self.record_for_training)
+        self.rec_btn = self._btn(cc, "Start Recording", BLUE, self._toggle_train_record)
         self.rec_btn.pack(fill="x", pady=(0, 14))
-
         self.coll_stats = self._label(cc, "", color=MUTED, size=9, justify="left")
         self.coll_stats.pack(anchor="w")
         self._refresh_stats()
 
-        # ── train card ──
         tc = self._card(outer, padx=16, pady=16)
         tc.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-
         self._label(tc, "2  Train", size=11, bold=True).pack(anchor="w", pady=(0, 12))
         self._label(tc, "Trains a new model from all recorded data.",
                     color=MUTED, size=9, wraplength=260, justify="left").pack(anchor="w", pady=(0, 14))
-
         self.train_btn = self._btn(tc, "Train Model", GREEN, self.manual_train)
         self.train_btn.pack(fill="x", pady=(0, 12))
-
         self.train_prog = ttk.Progressbar(tc, orient="horizontal", mode="determinate")
         self.train_prog.pack(fill="x", pady=(0, 8))
-
         self.train_status = self._label(tc, "Ready", color=MUTED, size=9)
         self.train_status.pack(anchor="w")
 
-    # ── recording / training logic ────────────────────────────────────────────
+    # ── open-ended recording — inspect ────────────────────────────────────────
 
-    def record_for_training(self):
-        category = self.cat_var.get()
+    def _toggle_live(self):
+        if not self.models_loaded:
+            messagebox.showwarning("No Model", "Train the model first.")
+            return
+        if self._stream is None:
+            self._rec_buffer = []
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1,
+                callback=self._inspect_callback
+            )
+            self._stream.start()
+            self._set_dot(RED)
+            self.live_btn.config(text="Stop & Analyse", bg=GREEN)
+            self.res_status.config(text="Recording…", fg=MUTED)
+        else:
+            self._stop_inspect_stream()
+
+    def _inspect_callback(self, indata, frames, time_info, status):
+        self._rec_buffer.append(indata.copy())
+
+    def _stop_inspect_stream(self):
+        if self._stream is None:
+            return
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+        self.live_btn.config(text="Start Live Check", bg=RED)
+        self._set_dot(GREEN)
+        if self._rec_buffer:
+            audio = np.concatenate(self._rec_buffer).flatten()
+            self._rec_buffer = []
+            self._analyse(audio, SAMPLE_RATE, "Live Mic")
+
+    # ── open-ended recording — train ──────────────────────────────────────────
+
+    def _toggle_train_record(self):
+        if self._train_stream is None:
+            self._train_buffer = []
+            self._train_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1,
+                callback=self._train_callback
+            )
+            self._train_stream.start()
+            self.rec_btn.config(text="Stop & Save", bg=RED)
+        else:
+            self._stop_train_stream()
+
+    def _train_callback(self, indata, frames, time_info, status):
+        self._train_buffer.append(indata.copy())
+
+    def _stop_train_stream(self):
+        if self._train_stream is None:
+            return
+        self._train_stream.stop()
+        self._train_stream.close()
+        self._train_stream = None
+        self.rec_btn.config(text="Start Recording", bg=BLUE)
+        if not self._train_buffer:
+            return
+        audio = np.concatenate(self._train_buffer).flatten()
+        self._train_buffer = []
+        self._save_training_audio(audio)
+
+    def _save_training_audio(self, audio):
         def task():
-            self.rec_btn.config(state="disabled", text="Recording…")
-            fs, dur = 22050, 3
+            self.rec_btn.config(state="disabled")
             try:
-                rec = sd.rec(int(dur * fs), samplerate=fs, channels=1)
-                sd.wait()
-                audio = rec.flatten()
+                peak = np.max(np.abs(audio))
+                normalized = audio / peak if peak > 0 else audio
+                category = self.cat_var.get()
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                sf.write(os.path.join(self.data_path, category, f"rec_{ts}.wav"), audio, fs)
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Saved", f"Saved as: {category}"))
+                path = os.path.join(self.data_path, category, f"rec_{ts}.wav")
+                sf.write(path, normalized, SAMPLE_RATE)
+                self.root.after(0, lambda: messagebox.showinfo("Saved", f"Saved as: {category}"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
             finally:
-                self.root.after(0, lambda: self.rec_btn.config(state="normal", text="Record 3s"))
+                self.root.after(0, lambda: self.rec_btn.config(state="normal"))
                 self.root.after(0, self._refresh_stats)
         threading.Thread(target=task, daemon=True).start()
 
     def _refresh_stats(self):
         lines = []
         for cat in ['normal', 'mechanical', 'electrical', 'wear']:
-            n = len([f for f in os.listdir(os.path.join(self.data_path, cat)) if f.endswith('.wav')])
+            n = len([f for f in os.listdir(os.path.join(self.data_path, cat))
+                     if f.endswith('.wav')])
             lines.append(f"{cat.capitalize()}: {n}")
         self.coll_stats.config(text="\n".join(lines))
 
+    # ── plots ─────────────────────────────────────────────────────────────────
+
+    def _style_ax(self, ax):
+        ax.set_facecolor(PLOT_BG)
+        ax.tick_params(colors=MUTED, labelsize=PLOT_FS)
+        ax.grid(True, linestyle="--", linewidth=GRID_LW, color=BORDER, alpha=0.8)
+        for sp in ax.spines.values():
+            sp.set_color(BORDER)
+
     def _draw_empty_plots(self):
-        for ax, title in ((self.ax_wave, "Waveform"), (self.ax_spec, "Frequency Spectrum")):
+        for ax, title, ylabel in (
+            (self.ax_wave,   "Waveform",          "Amplitude"),
+            (self.ax_spec,   "Frequency Spectrum", "Power (dB)"),
+            (self.ax_denoise,"Denoised",           "Amplitude"),
+        ):
             ax.clear()
-            ax.set_facecolor("#f8fafc")
-            ax.set_title(title, fontsize=8, color=MUTED, loc="left", pad=4)
-            ax.set_xlabel("" , fontsize=7.5, color=MUTED)
-            ax.tick_params(colors=MUTED, labelsize=7.5)
-            for spine in ax.spines.values():
-                spine.set_color(BORDER)
-        self.ax_wave.set_ylabel("Amplitude", fontsize=7.5, color=MUTED)
-        self.ax_spec.set_ylabel("Power (dB)", fontsize=7.5, color=MUTED)
+            ax.set_facecolor(PLOT_BG)
+            ax.set_title(title, fontsize=PLOT_TITLE_FS, color=MUTED, loc="left", pad=4)
+            ax.set_ylabel(ylabel, fontsize=PLOT_FS, color=MUTED)
+            ax.tick_params(colors=MUTED, labelsize=PLOT_FS)
+            for sp in ax.spines.values():
+                sp.set_color(BORDER)
         self.fig.canvas.draw_idle()
 
-    def _plot_audio(self, audio, sr, accent):
-        # ── waveform ──────────────────────────────────────────────────────
+    def _draw_plots(self, audio, sr, wave_color):
+        """Render all three subplots for the given audio."""
+        t    = np.linspace(0, len(audio) / sr, num=len(audio))
+        step = max(1, len(audio) // DRAW_POINTS)
+
+        # ── waveform ─────────────────────────────────────────────────────
         self.ax_wave.clear()
-        self.ax_wave.set_facecolor("#f8fafc")
-        t = np.linspace(0, len(audio) / sr, num=len(audio))
-        # downsample for drawing speed
-        step = max(1, len(audio) // 4000)
-        self.ax_wave.plot(t[::step], audio[::step], color=accent, linewidth=0.7)
-        rms_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-9)
+        self._style_ax(self.ax_wave)
+        self.ax_wave.plot(t[::step], audio[::step], color=wave_color, linewidth=PLOT_LW)
+        rms_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + LOG_EPS)
         peak   = np.max(np.abs(audio))
         self.ax_wave.set_title(
             f"Waveform   RMS {rms_db:.1f} dB   Peak {peak:.3f}",
-            fontsize=8, color=MUTED, loc="left", pad=4
+            fontsize=PLOT_TITLE_FS, color=MUTED, loc="left", pad=4
         )
-        self.ax_wave.set_xlabel("Time (s)", fontsize=7.5, color=MUTED)
-        self.ax_wave.set_ylabel("Amplitude", fontsize=7.5, color=MUTED)
+        self.ax_wave.set_xlabel("Time (s)",  fontsize=PLOT_FS, color=MUTED)
+        self.ax_wave.set_ylabel("Amplitude", fontsize=PLOT_FS, color=MUTED)
         self.ax_wave.set_xlim(0, len(audio) / sr)
-        self.ax_wave.axhline(0, color=BORDER, linewidth=0.5)
-        self.ax_wave.grid(True, linestyle="--", linewidth=0.4, color=BORDER, alpha=0.8)
-        self.ax_wave.tick_params(colors=MUTED, labelsize=7.5)
-        for sp in self.ax_wave.spines.values():
-            sp.set_color(BORDER)
+        self.ax_wave.axhline(0, color=BORDER, linewidth=ZERO_LINE_LW)
 
-        # ── FFT power spectrum ────────────────────────────────────────────
+        # ── FFT spectrum ──────────────────────────────────────────────────
         self.ax_spec.clear()
-        self.ax_spec.set_facecolor("#f8fafc")
-        n   = len(audio)
-        fft = np.abs(np.fft.rfft(audio * np.hanning(n)))
-        fft_db  = 20 * np.log10(fft / (n / 2) + 1e-9)
+        self._style_ax(self.ax_spec)
+        n       = len(audio)
+        fft     = np.abs(np.fft.rfft(audio * np.hanning(n)))
+        fft_db  = 20 * np.log10(fft / (n / 2) + LOG_EPS)
         freqs   = np.fft.rfftfreq(n, d=1 / sr)
-        # limit to 0-8 kHz (most machine fault content lives here)
-        mask    = freqs <= 8000
+        mask    = freqs <= MAX_FREQ_HZ
         dom_hz  = freqs[mask][np.argmax(fft_db[mask])]
-        self.ax_spec.plot(freqs[mask] / 1000, fft_db[mask], color=accent, linewidth=0.7)
-        self.ax_spec.axvline(dom_hz / 1000, color=RED, linewidth=0.8, linestyle="--", alpha=0.7)
-        self.ax_spec.text(dom_hz / 1000 + 0.05, self.ax_spec.get_ylim()[1] * 0.95 if self.ax_spec.get_ylim()[1] else -10,
+        self.ax_spec.plot(freqs[mask] / 1000, fft_db[mask], color=wave_color, linewidth=PLOT_LW)
+        self.ax_spec.axvline(dom_hz / 1000, color=RED, linewidth=DOM_FREQ_LW,
+                             linestyle="--", alpha=0.7)
+        ylim = self.ax_spec.get_ylim()
+        self.ax_spec.text(dom_hz / 1000 + DOM_FREQ_X_OFF, ylim[1] - (ylim[1] - ylim[0]) * 0.1,
                           f"{dom_hz:.0f} Hz", color=RED, fontsize=7)
         self.ax_spec.set_title(
             f"Frequency Spectrum   Dominant {dom_hz:.0f} Hz",
-            fontsize=8, color=MUTED, loc="left", pad=4
+            fontsize=PLOT_TITLE_FS, color=MUTED, loc="left", pad=4
         )
-        self.ax_spec.set_xlabel("Frequency (kHz)", fontsize=7.5, color=MUTED)
-        self.ax_spec.set_ylabel("Power (dB)",       fontsize=7.5, color=MUTED)
-        self.ax_spec.set_xlim(0, 8)
-        self.ax_spec.grid(True, linestyle="--", linewidth=0.4, color=BORDER, alpha=0.8)
-        self.ax_spec.tick_params(colors=MUTED, labelsize=7.5)
-        for sp in self.ax_spec.spines.values():
-            sp.set_color(BORDER)
+        self.ax_spec.set_xlabel("Frequency (kHz)", fontsize=PLOT_FS, color=MUTED)
+        self.ax_spec.set_ylabel("Power (dB)",       fontsize=PLOT_FS, color=MUTED)
+        self.ax_spec.set_xlim(0, MAX_FREQ_HZ / 1000)
+
+        # ── denoised waveform ─────────────────────────────────────────────
+        self.ax_denoise.clear()
+        self._style_ax(self.ax_denoise)
+        denoised = nr.reduce_noise(y=audio, sr=sr)
+        dn_rms   = 20 * np.log10(np.sqrt(np.mean(denoised ** 2)) + LOG_EPS)
+        self.ax_denoise.plot(t[::step], denoised[::step], color=BLUE, linewidth=PLOT_LW)
+        self.ax_denoise.set_title(
+            f"Denoised   RMS {dn_rms:.1f} dB",
+            fontsize=PLOT_TITLE_FS, color=MUTED, loc="left", pad=4
+        )
+        self.ax_denoise.set_xlabel("Time (s)",  fontsize=PLOT_FS, color=MUTED)
+        self.ax_denoise.set_ylabel("Amplitude", fontsize=PLOT_FS, color=MUTED)
+        self.ax_denoise.set_xlim(0, len(audio) / sr)
+        self.ax_denoise.axhline(0, color=BORDER, linewidth=ZERO_LINE_LW)
 
         self.wf_canvas.draw()
+
+    # ── real-time monitor ─────────────────────────────────────────────────────
+
+    def _toggle_realtime(self):
+        if not self.models_loaded:
+            messagebox.showwarning("No Model", "Train the model first.")
+            return
+        if self.is_realtime:
+            self.is_realtime = False
+            self.rt_btn.config(text="Real-time Monitor", bg=PURPLE)
+        else:
+            self.is_realtime = True
+            self.rt_btn.config(text="Stop Monitoring", bg=RED)
+            threading.Thread(target=self._realtime_loop, daemon=True).start()
+
+    def _realtime_loop(self):
+        while self.is_realtime:
+            rec = sd.rec(RT_CHUNK, samplerate=SAMPLE_RATE, channels=1)
+            sd.wait()
+            if not self.is_realtime:
+                break
+            audio = rec.flatten()
+            self.root.after(0, lambda a=audio: self._realtime_update(a))
+
+    def _realtime_update(self, audio):
+        self._draw_plots(audio, SAMPLE_RATE, PURPLE)
+
+        feat    = extract_features(audio, SAMPLE_RATE).reshape(1, -1)
+        pred    = self.binary_model.predict(feat)[0]
+        prob    = np.max(self.binary_model.predict_proba(feat)) * 100
+        diag    = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
+        healthy = pred == 0
+        color   = GREEN if healthy else RED
+        label   = "Healthy" if healthy else "Fault Detected"
+        score   = prob if healthy else 100 - prob
+
+        self.res_status.config(text=label, fg=color)
+        self.res_detail.config(text=f"{diag.capitalize()}  ·  {prob:.0f}% confidence")
+
+        self.health_bar.delete("all")
+        self.root.update_idletasks()
+        w = self.health_bar.winfo_width()
+        self.health_bar.create_rectangle(0, 0, (score / 100) * w, 6, fill=color, outline="")
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_box.config(state="normal")
+        self.log_box.insert("1.0", f"[{ts}]  Live  {label:<18} {diag}  {int(score)}%\n")
+        self.log_box.config(state="disabled")
+
+    # ── replay ────────────────────────────────────────────────────────────────
+
+    def _replay(self):
+        if self._last_audio is None:
+            return
+        def play():
+            self.root.after(0, lambda: self.replay_btn.config(state="disabled", text="Playing…"))
+            tmp_path = os.path.join(self.data_path, "_replay_tmp.wav")
+            try:
+                audio = self._last_audio
+                peak  = np.max(np.abs(audio))
+                if peak > 0:
+                    audio = audio / peak * REPLAY_NORM_PEAK
+                sf.write(tmp_path, audio, self._last_sr)
+                winsound.PlaySound(tmp_path, winsound.SND_FILENAME)
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Playback Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.replay_btn.config(state="normal", text="Replay"))
+        threading.Thread(target=play, daemon=True).start()
+
+    # ── core analysis ─────────────────────────────────────────────────────────
 
     def _set_dot(self, color):
         self.dot.delete("all")
@@ -330,138 +494,14 @@ class MachineHealthApp:
             return
         path = filedialog.askopenfilename(filetypes=[("Audio", "*.wav")])
         if path:
-            audio, sr = librosa.load(path, sr=22050)
+            audio, sr = librosa.load(path, sr=SAMPLE_RATE)
             self._analyse(audio, sr, os.path.basename(path))
-
-    def start_recording(self):
-        if not self.models_loaded:
-            messagebox.showwarning("No Model", "Train the model first.")
-            return
-        if self.is_recording:
-            return
-        def run():
-            self.is_recording = True
-            self._set_dot(RED)
-            self.root.after(0, lambda: self.res_status.config(text="Recording…", fg=MUTED))
-            fs, dur = 22050, 3
-            try:
-                rec = sd.rec(int(dur * fs), samplerate=fs, channels=1)
-                sd.wait()
-                self.root.after(0, lambda: self._analyse(rec.flatten(), fs, "Live Mic"))
-            finally:
-                self.is_recording = False
-                self.root.after(0, lambda: self._set_dot(GREEN))
-        threading.Thread(target=run, daemon=True).start()
-
-    def _toggle_realtime(self):
-        if not self.models_loaded:
-            messagebox.showwarning("No Model", "Train the model first.")
-            return
-        if self.is_realtime:
-            self.is_realtime = False
-            self.rt_btn.config(text="Real-time Monitor", bg="#7c3aed")
-        else:
-            self.is_realtime = True
-            self.rt_btn.config(text="Stop Monitoring", bg=RED)
-            threading.Thread(target=self._realtime_loop, daemon=True).start()
-
-    def _realtime_loop(self):
-        fs, chunk = 22050, 22050  # 1-second chunks
-        while self.is_realtime:
-            rec = sd.rec(chunk, samplerate=fs, channels=1)
-            sd.wait()
-            if not self.is_realtime:
-                break
-            audio = rec.flatten()
-            self.root.after(0, lambda a=audio: self._realtime_update(a, fs))
-
-    def _realtime_update(self, audio, sr):
-        # ── plots ────────────────────────────────────────────────────────
-        self.ax_wave.clear()
-        self.ax_wave.set_facecolor("#f8fafc")
-        t = np.linspace(0, len(audio) / sr, num=len(audio))
-        self.ax_wave.plot(t, audio, color="#7c3aed", linewidth=0.7)
-        rms_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-9)
-        peak   = np.max(np.abs(audio))
-        self.ax_wave.set_title(f"Waveform   RMS {rms_db:.1f} dB   Peak {peak:.3f}",
-                               fontsize=8, color=MUTED, loc="left", pad=4)
-        self.ax_wave.set_xlabel("Time (s)", fontsize=7.5, color=MUTED)
-        self.ax_wave.set_ylabel("Amplitude", fontsize=7.5, color=MUTED)
-        self.ax_wave.set_xlim(0, len(audio) / sr)
-        self.ax_wave.axhline(0, color=BORDER, linewidth=0.5)
-        self.ax_wave.grid(True, linestyle="--", linewidth=0.4, color=BORDER, alpha=0.8)
-        self.ax_wave.tick_params(colors=MUTED, labelsize=7.5)
-        for sp in self.ax_wave.spines.values():
-            sp.set_color(BORDER)
-
-        self.ax_spec.clear()
-        self.ax_spec.set_facecolor("#f8fafc")
-        n      = len(audio)
-        fft    = np.abs(np.fft.rfft(audio * np.hanning(n)))
-        fft_db = 20 * np.log10(fft / (n / 2) + 1e-9)
-        freqs  = np.fft.rfftfreq(n, d=1 / sr)
-        mask   = freqs <= 8000
-        dom_hz = freqs[mask][np.argmax(fft_db[mask])]
-        self.ax_spec.plot(freqs[mask] / 1000, fft_db[mask], color="#7c3aed", linewidth=0.7)
-        self.ax_spec.axvline(dom_hz / 1000, color=RED, linewidth=0.8, linestyle="--", alpha=0.7)
-        self.ax_spec.set_title(f"Frequency Spectrum   Dominant {dom_hz:.0f} Hz",
-                               fontsize=8, color=MUTED, loc="left", pad=4)
-        self.ax_spec.set_xlabel("Frequency (kHz)", fontsize=7.5, color=MUTED)
-        self.ax_spec.set_ylabel("Power (dB)",       fontsize=7.5, color=MUTED)
-        self.ax_spec.set_xlim(0, 8)
-        self.ax_spec.grid(True, linestyle="--", linewidth=0.4, color=BORDER, alpha=0.8)
-        self.ax_spec.tick_params(colors=MUTED, labelsize=7.5)
-        for sp in self.ax_spec.spines.values():
-            sp.set_color(BORDER)
-        self.wf_canvas.draw()
-
-        # ── prediction ───────────────────────────────────────────────────
-        feat    = extract_features(audio, sr).reshape(1, -1)
-        pred    = self.binary_model.predict(feat)[0]
-        prob    = np.max(self.binary_model.predict_proba(feat)) * 100
-        diag    = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
-        healthy = pred == 0
-        color   = GREEN if healthy else RED
-        label   = "Healthy" if healthy else "Fault Detected"
-        score   = prob if healthy else 100 - prob
-
-        self.res_status.config(text=label, fg=color)
-        self.res_detail.config(text=f"{diag.capitalize()}  ·  {prob:.0f}% confidence")
-
-        self.health_bar.delete("all")
-        self.root.update_idletasks()
-        w = self.health_bar.winfo_width()
-        self.health_bar.create_rectangle(0, 0, (score / 100) * w, 6, fill=color, outline="")
-
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_box.config(state="normal")
-        self.log_box.insert("1.0", f"[{ts}]  Live  {label:<18} {diag}  {int(score)}%\n")
-        self.log_box.config(state="disabled")
-
-    def _replay(self):
-        if self._last_audio is None:
-            return
-        def play():
-            self.root.after(0, lambda: self.replay_btn.config(state="disabled", text="Playing…"))
-            tmp_path = os.path.join(self.data_path, "_replay_tmp.wav")
-            try:
-                audio = self._last_audio
-                peak = np.max(np.abs(audio))
-                if peak > 0:
-                    audio = audio / peak * 0.95
-                sf.write(tmp_path, audio, self._last_sr)
-                winsound.PlaySound(tmp_path, winsound.SND_FILENAME)
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Playback Error", str(e)))
-            finally:
-                self.root.after(0, lambda: self.replay_btn.config(state="normal", text="Replay"))
-        threading.Thread(target=play, daemon=True).start()
 
     def _analyse(self, audio, sr, source):
         self._last_audio = audio
         self._last_sr    = sr
         self.replay_btn.config(state="normal")
-        # prediction
+
         feat    = extract_features(audio, sr).reshape(1, -1)
         pred    = self.binary_model.predict(feat)[0]
         prob    = np.max(self.binary_model.predict_proba(feat)) * 100
@@ -471,18 +511,16 @@ class MachineHealthApp:
         label   = "Healthy" if healthy else "Fault Detected"
         score   = prob if healthy else 100 - prob
 
-        self._plot_audio(audio, sr, color)
+        self._draw_plots(audio, sr, color)
 
         self.res_status.config(text=label, fg=color)
         self.res_detail.config(text=f"{diag.capitalize()}  ·  {prob:.0f}% confidence")
 
-        # health bar
         self.health_bar.delete("all")
         self.root.update_idletasks()
         w = self.health_bar.winfo_width()
         self.health_bar.create_rectangle(0, 0, (score / 100) * w, 6, fill=color, outline="")
 
-        # log
         self.log_box.config(state="normal")
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_box.insert("1.0", f"[{ts}]  {source:<20} {label:<18} {diag}  {int(score)}%\n")
@@ -496,11 +534,13 @@ class MachineHealthApp:
             try:
                 for idx, c in enumerate(cats):
                     self.root.after(0, lambda c=c: self.train_status.config(text=f"Loading {c}…"))
-                    for f in [f for f in os.listdir(os.path.join(self.data_path, c)) if f.endswith('.wav')]:
-                        audio, sr = librosa.load(os.path.join(self.data_path, c, f), sr=22050)
+                    for f in [f for f in os.listdir(os.path.join(self.data_path, c))
+                              if f.endswith('.wav')]:
+                        audio, sr = librosa.load(os.path.join(self.data_path, c, f),
+                                                 sr=SAMPLE_RATE)
                         X.append(extract_features(audio, sr))
                         y.append(c)
-                    self.root.after(0, lambda v=(idx+1)*20: self.train_prog.config(value=v))
+                    self.root.after(0, lambda v=(idx + 1) * 20: self.train_prog.config(value=v))
 
                 if not X:
                     messagebox.showerror("Error", "No audio files found in data folders.")
@@ -511,8 +551,8 @@ class MachineHealthApp:
                 yenc = le.fit_transform(y)
                 ybin = np.array([0 if i == 'normal' else 1 for i in y])
 
-                m_bin   = RandomForestClassifier(n_estimators=100).fit(X, ybin)
-                m_multi = RandomForestClassifier(n_estimators=100).fit(X, yenc)
+                m_bin   = RandomForestClassifier(n_estimators=N_ESTIMATORS).fit(X, ybin)
+                m_multi = RandomForestClassifier(n_estimators=N_ESTIMATORS).fit(X, yenc)
 
                 joblib.dump(m_bin,   'model_binary.pkl')
                 joblib.dump(m_multi, 'model_multiclass.pkl')
