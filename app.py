@@ -544,16 +544,25 @@ class MachineHealthApp:
         feat       = extract_features(audio, sr).reshape(1, -1)
         pred       = self.binary_model.predict(feat)[0]
         prob       = np.max(self.binary_model.predict_proba(feat)) * 100
+        multi_probs = self.multi_model.predict_proba(feat)[0]  # Get all class probabilities
+        max_class_prob = np.max(multi_probs) * 100  # Max probability among all classes
         diag       = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
         threshold  = self.conf_slider.get()
 
-        # If no meaningful sound detected, show "No Motor Sound"
+        # ── DETECTION GATES ────────────────────────────────────────────────────────────
+        # If no meaningful sound detected, show "No Sound"
         if rms < energy_threshold:
-            display_label = "No Motor Sound"
+            display_label = "No Sound"
+            color = MUTED
+            score = 0
+        # If model confidence is low across all classes, likely unknown audio
+        # Threshold: max class probability < 60% = not confident → "No Machine Sound"
+        elif max_class_prob < 60:
+            display_label = "No Machine Sound"
             color = MUTED
             score = 0
         elif prob < threshold:
-            display_label = "No Motor Sound"
+            display_label = "No Machine Sound"
             color = MUTED
             score = 0
         else:
