@@ -160,6 +160,19 @@ class MachineHealthApp:
         self.replay_btn.config(state="disabled")
         self.replay_btn.pack(side="left")
 
+        # Confidence threshold slider
+        slider_frame = tk.Frame(self.inspect_tab, bg=BG)
+        slider_frame.pack(fill="x", padx=14, pady=(0, 8))
+        self._label(slider_frame, "Confidence Threshold", size=9, color=MUTED).pack(anchor="w", pady=(0, 4))
+        slider_container = tk.Frame(slider_frame, bg=BG)
+        slider_container.pack(fill="x", pady=(0, 4))
+        self.conf_slider = ttk.Scale(slider_container, from_=0, to=100, orient="horizontal")
+        self.conf_slider.set(50)
+        self.conf_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.conf_value = self._label(slider_container, "50%", size=9, color=MUTED, width=4)
+        self.conf_value.pack(side="left")
+        self.conf_slider.config(command=self._update_slider_label)
+
         wf_card = self._card(self.inspect_tab, pady=6)
         wf_card.pack(fill="x", padx=14, pady=(4, 8))
         self.fig, (self.ax_wave, self.ax_spec, self.ax_denoise) = plt.subplots(
@@ -427,17 +440,37 @@ class MachineHealthApp:
     def _realtime_update(self, audio):
         self._draw_plots(audio, SAMPLE_RATE, PURPLE)
 
-        feat    = extract_features(audio, SAMPLE_RATE).reshape(1, -1)
-        pred    = self.binary_model.predict(feat)[0]
-        prob    = np.max(self.binary_model.predict_proba(feat)) * 100
-        diag    = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
-        healthy = pred == 0
-        color   = GREEN if healthy else RED
-        label   = "Healthy" if healthy else "Fault Detected"
-        score   = prob if healthy else 100 - prob
+        # Check audio energy (RMS) to detect if sound is actually playing
+        rms = np.sqrt(np.mean(audio ** 2))
+        energy_threshold = 0.01  # Threshold for detecting if sound is present
 
-        self.res_status.config(text=label, fg=color)
-        self.res_detail.config(text=f"{diag.capitalize()}  ·  {prob:.0f}% confidence")
+        feat       = extract_features(audio, SAMPLE_RATE).reshape(1, -1)
+        pred       = self.binary_model.predict(feat)[0]
+        prob       = np.max(self.binary_model.predict_proba(feat)) * 100
+        diag       = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
+        threshold  = self.conf_slider.get()
+
+        # If no meaningful sound detected, show "No Motor Sound"
+        if rms < energy_threshold:
+            display_label = "No Motor Sound"
+            color = MUTED
+            score = 0
+        elif prob < threshold:
+            display_label = "No Motor Sound"
+            color = MUTED
+            score = 0
+        else:
+            if diag == 'normal':
+                display_label = 'Normal'
+                color = GREEN
+                score = prob
+            else:
+                display_label = f"{diag.capitalize()} Fault"
+                color = RED
+                score = 100 - prob
+
+        self.res_status.config(text=display_label, fg=color)
+        self.res_detail.config(text=f"{prob:.0f}% confidence")
 
         self.health_bar.delete("all")
         self.root.update_idletasks()
@@ -446,7 +479,7 @@ class MachineHealthApp:
 
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_box.config(state="normal")
-        self.log_box.insert("1.0", f"[{ts}]  Live  {label:<18} {diag}  {int(score)}%\n")
+        self.log_box.insert("1.0", f"[{ts}]  Live  {display_label:<18} {prob:.0f}%\n")
         self.log_box.config(state="disabled")
 
     # ── replay ────────────────────────────────────────────────────────────────
@@ -470,6 +503,10 @@ class MachineHealthApp:
         threading.Thread(target=play, daemon=True).start()
 
     # ── core analysis ─────────────────────────────────────────────────────────
+
+    def _update_slider_label(self, value):
+        """Update confidence threshold slider display value."""
+        self.conf_value.config(text=f"{int(float(value))}%")
 
     def _set_dot(self, color):
         self.dot.delete("all")
@@ -500,19 +537,39 @@ class MachineHealthApp:
         self._last_sr    = sr
         self.replay_btn.config(state="normal")
 
-        feat    = extract_features(audio, sr).reshape(1, -1)
-        pred    = self.binary_model.predict(feat)[0]
-        prob    = np.max(self.binary_model.predict_proba(feat)) * 100
-        diag    = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
-        healthy = pred == 0
-        color   = GREEN if healthy else RED
-        label   = "Healthy" if healthy else "Fault Detected"
-        score   = prob if healthy else 100 - prob
+        # Check audio energy (RMS) to detect if sound is actually playing
+        rms = np.sqrt(np.mean(audio ** 2))
+        energy_threshold = 0.01  # Threshold for detecting if sound is present
+
+        feat       = extract_features(audio, sr).reshape(1, -1)
+        pred       = self.binary_model.predict(feat)[0]
+        prob       = np.max(self.binary_model.predict_proba(feat)) * 100
+        diag       = self.label_encoder.inverse_transform([self.multi_model.predict(feat)[0]])[0]
+        threshold  = self.conf_slider.get()
+
+        # If no meaningful sound detected, show "No Motor Sound"
+        if rms < energy_threshold:
+            display_label = "No Motor Sound"
+            color = MUTED
+            score = 0
+        elif prob < threshold:
+            display_label = "No Motor Sound"
+            color = MUTED
+            score = 0
+        else:
+            if diag == 'normal':
+                display_label = 'Normal'
+                color = GREEN
+                score = prob
+            else:
+                display_label = f"{diag.capitalize()} Fault"
+                color = RED
+                score = 100 - prob
 
         self._draw_plots(audio, sr, color)
 
-        self.res_status.config(text=label, fg=color)
-        self.res_detail.config(text=f"{diag.capitalize()}  ·  {prob:.0f}% confidence")
+        self.res_status.config(text=display_label, fg=color)
+        self.res_detail.config(text=f"{prob:.0f}% confidence")
 
         self.health_bar.delete("all")
         self.root.update_idletasks()
@@ -521,7 +578,7 @@ class MachineHealthApp:
 
         self.log_box.config(state="normal")
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_box.insert("1.0", f"[{ts}]  {source:<20} {label:<18} {diag}  {int(score)}%\n")
+        self.log_box.insert("1.0", f"[{ts}]  {source:<20} {display_label:<18} {prob:.0f}%\n")
         self.log_box.config(state="disabled")
 
     def manual_train(self):
